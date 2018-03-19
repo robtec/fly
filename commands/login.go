@@ -6,13 +6,12 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/concourse/atc"
 	"github.com/concourse/fly/rc"
 	"github.com/concourse/go-concourse/concourse"
-	"github.com/concourse/skymarshal/provider"
-	"github.com/vito/go-interact/interact"
 )
 
 type LoginCommand struct {
@@ -67,6 +66,7 @@ func (command *LoginCommand) Execute(args []string) error {
 		return err
 	}
 
+	client := target.Client()
 	command.TeamName = target.Team().Name()
 
 	fmt.Printf("logging in to team '%s'\n\n", command.TeamName)
@@ -80,58 +80,14 @@ func (command *LoginCommand) Execute(args []string) error {
 		return err
 	}
 
-	authMethods, err := target.Team().ListAuthMethods()
-	if err != nil {
-		return err
-	}
+	var tokenType string
+	var tokenValue string
 
-	var chosenMethod provider.AuthMethod
-
-	if command.Username != "" || command.Password != "" {
-
-		for _, method := range authMethods {
-			if method.Type == provider.AuthTypeBasic {
-				chosenMethod = method
-				break
-			}
-		}
-
-		if chosenMethod.Type == "" {
-			return errors.New("basic auth is not available")
-		}
-
+	if command.Username != "" && command.Password != "" {
+		tokenType, tokenValue, err = command.passwordGrant(client, command.Username, command.Password)
 	} else {
-
-		choices := make([]interact.Choice, len(authMethods))
-
-		for i, method := range authMethods {
-			choices[i] = interact.Choice{
-				Display: method.DisplayName,
-				Value:   method,
-			}
-		}
-
-		if len(choices) == 0 {
-			// FIXME: this is put here for backwards compatibility, eventually this should throw an error
-			chosenMethod = provider.AuthMethod{
-				Type: provider.AuthTypeNone,
-			}
-		}
-
-		if len(choices) == 1 {
-			chosenMethod = authMethods[0]
-		}
-
-		if len(choices) > 1 {
-			err = interact.NewInteraction("choose an auth method", choices...).Resolve(&chosenMethod)
-			if err != nil {
-				return err
-			}
-		}
+		tokenType, tokenValue, err = command.authCodeGrant(client.URL())
 	}
-
-	client := target.Client()
-	token, err := command.loginWith(chosenMethod, client, target.CACert(), target.Client().URL())
 	if err != nil {
 		return err
 	}
@@ -141,11 +97,60 @@ func (command *LoginCommand) Execute(args []string) error {
 	return command.saveTarget(
 		client.URL(),
 		&rc.TargetToken{
-			Type:  token.Type,
-			Value: token.Value,
+			Type:  tokenType,
+			Value: tokenValue,
 		},
 		target.CACert(),
 	)
+}
+
+func (command *LoginCommand) passwordGrant(client concourse.Client, username, password string) (string, string, error) {
+
+	token, err := client.PasswordGrant(username, password)
+	if err != nil {
+		return "", "", err
+	}
+
+	return token.TokenType, token.AccessToken, nil
+}
+
+func (command *LoginCommand) authCodeGrant(targetUrl string) (string, string, error) {
+
+	var tokenStr string
+
+	stdinChannel := make(chan string)
+	tokenChannel := make(chan string)
+	errorChannel := make(chan error)
+	portChannel := make(chan string)
+
+	go listenForTokenCallback(tokenChannel, errorChannel, portChannel, targetUrl)
+
+	port := <-portChannel
+
+	redirectUrl, err := url.Parse("http://127.0.0.1:" + port + "/auth/callback")
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("navigate to the following URL in your browser:")
+	fmt.Println("")
+	fmt.Printf("    %s/sky/login?redirect=%s\n", targetUrl, redirectUrl.String())
+	fmt.Println("")
+
+	go waitForTokenInput(stdinChannel, errorChannel)
+
+	select {
+	case tokenStrMsg := <-tokenChannel:
+		tokenStr = tokenStrMsg
+	case tokenStrMsg := <-stdinChannel:
+		tokenStr = tokenStrMsg
+	case errorMsg := <-errorChannel:
+		return "", "", errorMsg
+	}
+
+	segments := strings.SplitN(tokenStr, " ", 2)
+
+	return segments[0], segments[1], nil
 }
 
 func listenForTokenCallback(tokenChannel chan string, errorChannel chan error, portChannel chan string, targetUrl string) {
@@ -164,111 +169,25 @@ func listenForTokenCallback(tokenChannel chan string, errorChannel chan error, p
 	}
 }
 
-func (command *LoginCommand) loginWith(
-	method provider.AuthMethod,
-	client concourse.Client,
-	caCert string,
-	targetUrl string,
-) (*provider.AuthToken, error) {
-	var token provider.AuthToken
-
-	switch method.Type {
-	case provider.AuthTypeOAuth:
-		var tokenStr string
-
-		stdinChannel := make(chan string)
-		tokenChannel := make(chan string)
-		errorChannel := make(chan error)
-		portChannel := make(chan string)
-
-		go listenForTokenCallback(tokenChannel, errorChannel, portChannel, targetUrl)
-
-		port := <-portChannel
-
-		fmt.Println("navigate to the following URL in your browser:")
-		fmt.Println("")
-		fmt.Printf("    %s&fly_local_port=%s\n", method.AuthURL, port)
-		fmt.Println("")
-
-		go waitForTokenInput(stdinChannel, errorChannel)
-
-		select {
-		case tokenStrMsg := <-tokenChannel:
-			tokenStr = tokenStrMsg
-		case tokenStrMsg := <-stdinChannel:
-			tokenStr = tokenStrMsg
-		case errorMsg := <-errorChannel:
-			return nil, errorMsg
-		}
-
-		segments := strings.SplitN(tokenStr, " ", 2)
-
-		token.Type = segments[0]
-		token.Value = segments[1]
-
-	case provider.AuthTypeBasic:
-		var username string
-		if command.Username != "" {
-			username = command.Username
-		} else {
-			err := interact.NewInteraction("username").Resolve(interact.Required(&username))
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		var password string
-		if command.Password != "" {
-			password = command.Password
-		} else {
-			var interactivePassword interact.Password
-			err := interact.NewInteraction("password").Resolve(interact.Required(&interactivePassword))
-			if err != nil {
-				return nil, err
-			}
-			password = string(interactivePassword)
-		}
-
-		target, err := rc.NewBasicAuthTarget(
-			Fly.Target,
-			client.URL(),
-			command.TeamName,
-			command.Insecure,
-			username,
-			password,
-			caCert,
-			Fly.Verbose,
-		)
-		if err != nil {
-			return nil, err
-		}
-
-		token, err = target.Team().AuthToken()
-		if err != nil {
-			return nil, err
-		}
-	case provider.AuthTypeNone:
-		target, err := rc.NewNoAuthTarget(
-			Fly.Target,
-			client.URL(),
-			command.TeamName,
-			command.Insecure,
-			caCert,
-			Fly.Verbose,
-		)
-		if err != nil {
-			fmt.Println(err)
-			return nil, err
-		}
-
-		token, err = target.Team().AuthToken()
-		if err != nil {
-			fmt.Println(err)
-			return nil, err
-		}
+func listenAndServeWithPort(srv *http.Server, portChannel chan string) error {
+	addr := srv.Addr
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
 	}
 
-	return &token, nil
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		return err
+	}
+
+	portChannel <- port
+
+	return srv.Serve(tcpKeepAliveListener{ln.(*net.TCPListener)})
+}
+
+type tcpKeepAliveListener struct {
+	*net.TCPListener
 }
 
 func waitForTokenInput(tokenChannel chan string, errorChannel chan error) {
@@ -312,25 +231,4 @@ func (command *LoginCommand) saveTarget(url string, token *rc.TargetToken, caCer
 	fmt.Println("target saved")
 
 	return nil
-}
-
-func listenAndServeWithPort(srv *http.Server, portChannel chan string) error {
-	addr := srv.Addr
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
-	}
-
-	_, port, err := net.SplitHostPort(ln.Addr().String())
-	if err != nil {
-		return err
-	}
-
-	portChannel <- port
-
-	return srv.Serve(tcpKeepAliveListener{ln.(*net.TCPListener)})
-}
-
-type tcpKeepAliveListener struct {
-	*net.TCPListener
 }
